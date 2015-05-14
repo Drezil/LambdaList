@@ -24,6 +24,9 @@ import Data.List.Split           (splitOn)
 import qualified Data.Text       as T
 import qualified Data.Text.Lazy  as TL
 
+import Control.Monad.Trans.RWS
+import Control.Monad.IO.Class
+
 import System.IO
 import System.Exit
 import System.Directory
@@ -31,10 +34,7 @@ import System.Posix.Files
 
 import Network.Mail.SMTP
 
--- NICE TO HAVES:
--- --> ausführliche Dokumentation
-
--- Kung-Fu mit Typen
+-- TYPEN --
 
 type Name        = String
 type User        = String
@@ -46,28 +46,52 @@ data NInterp     = NNull | NNothing
 
 data NumberType  = Money | Amount
 
-data MailAdress  = Adress User Domain -- user provided an e-mail adress
+data Mailaddress = Adress User Domain -- user provided an e-mail adress
                  | DefaultAdress      -- user has the standard e-mail pattern
                  | NoAdress           -- user provided no e-mail adress
                  | Mty                -- E-mail adress was not evaluated until now
 
 data TColor      = TBlau | TGruen | TRot | TGelb
 
-data Trinker     = Trinker { name     :: String
-                           , guthaben :: Guthaben
-                           , mailadr  :: MailAdress
-                           , counter  :: Int
-                           , inactive :: Bool
-                           }
+data Trinker     = Trinker
+                   {
+                     name     :: String,
+                     guthaben :: Guthaben,
+                     mailaddr :: Mailaddress,
+                     inac_cnt :: Int,
+                     inac_flg :: Bool
+                   }
 
-data Config      = Config { stdDomain  :: String
-                          , stdHost    :: String
-                          , absender   :: String
-                          , logcc      :: String
-                          , grenze     :: Int
-                          , extra      :: Int
-                          , kontodaten :: String
-                          }
+data ListState   = ListState
+                   {
+                     index :: Int,
+                     list  :: [Trinker]
+                   }
+
+data Environment = Environment
+                   {
+                     stdDomain :: String,
+                     stdHost   :: String,
+                     absender  :: String,
+                     logmail   :: String,
+                     kontoInfo :: String,
+                     grenzeNeg :: Int,
+                     grenzePos :: Int
+                   }
+
+data Input       = Input
+                   {
+                     bearbeiten     :: Char,
+                     ueberschreiben :: Char,
+                     loeschen       :: Char,
+                     neu            :: Char,
+                     abbrechen      :: Char,
+                     beenden        :: Char,
+                     vor            :: Char,
+                     zurueck        :: Char
+                   }
+
+-- TYPKLASSENINSTANZEN --
 
 instance Eq Trinker where
       t0 == t1 = (name t0) == (name t1)
@@ -81,7 +105,7 @@ instance Show Trinker where
           updatedWerte = if not f then [a, show b, showMail c a, show (d+1)]
                                   else [a, show b, showMail c a, show d]
 
-          showMail :: MailAdress -> String -> String
+          showMail :: mailaddress -> String -> String
           showMail (Adress u d)    _  = u  ++ '@':d
           showMail (DefaultAdress) nm = nm ++ " auf der Standarddomain "
           showMail (NoAdress)      _  = "n/a"
@@ -94,6 +118,11 @@ instance Show Guthaben where
                addZeros
                   | abs a <= 9 = ("0" ++)
                   | otherwise  = id
+
+-- Konstanten --
+
+stdInputMapping :: Input
+stdInputMapping = Input 'b' 'r' 'l' 'n' 'a' 'e' 'v' 'z'
 
 -- Datei - Ein- und Ausgabe
 
@@ -114,7 +143,7 @@ parseListe fp = do a <- readFile fp
                                   Nothing ->       error $ "Parsingfehler (Guthaben) hier: " ++ b
       parseTrinker _         =                     error   "Parsingfehler: inkorrekte Anzahl Elemente in mindestens einer Zeile"
 
-writeFiles :: [Trinker] -> Config -> IO()
+writeFiles :: RWST Environment () ListState IO ()
 writeFiles trinker c = let sortedTrinker = sort trinker
                         in do putStr    "\nSchreibe .txt und .tex auf Festplatte ... "
 
@@ -193,14 +222,14 @@ sendAllMails xs c = do lst <- processList c xs True
                        putStrLn "\nSendevorgang abgeschlossen."
 
 sendEvilEmail :: Config -> Trinker -> IO ()
-sendEvilEmail config t = case mailadr t of
+sendEvilEmail config t = case mailaddr t of
                               Mty      -> putStrLn $ showFarbe TRot "    ->" ++ " Konnte keine böse E-Mail an " ++ showFarbe TBlau (name t) ++ " senden, da noch keine E-Mail-Adresse angegeben wurde."
                               NoAdress -> putStrLn $ showFarbe TRot "    ->" ++ " Konnte keine böse E-Mail an " ++ showFarbe TBlau (name t) ++ " senden, da keine E-Mail-Adresse eingetragen wurde."
                               mMail    -> do let from  = Address (Just "Fachschaft Technik") ((T.pack . absender) config)
                                              let to      = case mMail of
                                                                 DefaultAdress -> (Address Nothing (T.pack ((name t) ++ '@':(stdDomain config))))
                                                                 (Adress u d)  -> (Address Nothing (T.pack (u  ++ '@':d)))
-                                             let cc      = [(Address (Just "Getränkefuzzi") ((T.pack . logcc) config))] -- Empty list if no logging emails are desired
+                                             let cc      = [(Address (Just "Getränkefuzzi") ((T.pack . logmail) config))] -- Empty list if no logging emails are desired
                                              let bcc     = []
                                              let subject = "[Fachschaft Technik] Mate-Konto ausgleichen!"
                                              let body    = plainTextPart $ TL.pack $ composeEvilEmail (name t) (guthaben t)
@@ -213,7 +242,7 @@ sendEvilEmail config t = case mailadr t of
                               ++ "\nGenauer gesagt ist dein Guthaben auf der Mateliste aktuell: EUR " ++ show g ++ "\n\n"
                               ++ "Es handelt sich hier generell um ein Prepaid-Konto und wenn zu viele\nLeute zu stark im Minus sind, bedeutet das, dass wir keine Mate"
                               ++ "\nbestellen können oder wir sie teurer verkaufen müssen. Ich würde dich\nalso bitten, fluchs wieder etwas einzuzahlen.\n\n"
-                              ++ "Du kannst uns natürlich auch einfach etwas überweisen. Kontoverbindung:\n\n" ++ (kontodaten config) ++ "\n\n"
+                              ++ "Du kannst uns natürlich auch einfach etwas überweisen. Kontoverbindung:\n\n" ++ (kontoInfo config) ++ "\n\n"
                               ++ "Bitte nicht vergessen, euren Login oder Namen in den Verwendungszweck\nzu packen, sodass man euch identifizieren kann. Inzwischen kann man\n"
                               ++ "auch in der Fachschaft Bargeld hinterlegen, wenn mal der Mate-Fuzzi\nnicht da ist. Bittet dazu einfach einen beliebigen Fachschaftler\n"
                               ++ "das Geld im entsprechenden Briefumschlag in der Protokollkasse zu\ndeponieren.\n\n"
@@ -246,7 +275,7 @@ showTrinkerInfo :: Trinker -> IO ()
 showTrinkerInfo t = putStrLn $ "\nDer User " ++ showFarbe TBlau (name t) ++ inac ++ " hat derzeit einen Kontostand von " ++ showGuthaben (guthaben t) ++ "."
     where
       inac :: String
-      inac = if (counter t) == 0 then "" else " (" ++ show (counter t) ++ " Mal inaktiv)"
+      inac = if (inac_cnt t) == 0 then "" else " (" ++ show (inac_cnt t) ++ " Mal inaktiv)"
 
 cleanGuthaben :: String -> Maybe Int
 cleanGuthaben s = case readInt NNull $ filter (\c -> (c /= '.') && (c /= ',') ) s
@@ -306,8 +335,8 @@ parseConfig mconf kconf = Config (ls !! 0) (ls !! 1) (ls !! 2) (ls !! 3) thresho
 processTrinker :: Trinker -> [Int] -> IO Trinker
 processTrinker t werte@[enzhlng, nnzg, sbzg, fnfzg, zwnzg, zhn, fnf]
                = return $ if all (==0) werte
-                     then Trinker (name t) (guthaben t)                                                      (mailadr t) ((counter t) + 1) True
-                     else Trinker (name t) (Guthaben ((unwrapGuthaben . guthaben) t + enzhlng - vertrunken)) (mailadr t) 0                 True
+                     then Trinker (name t) (guthaben t)                                                      (mailaddr t) ((inac_cnt t) + 1) True
+                     else Trinker (name t) (Guthaben ((unwrapGuthaben . guthaben) t + enzhlng - vertrunken)) (mailaddr t) 0                  True
     where
       vertrunken = sum $ zipWith (*) [90, 70, 50, 20, 10, 5] (tail werte)
 
@@ -351,11 +380,12 @@ clearPermissions x = do ptxt <- getPermissions "./mateliste.txt"
                                      return $ and [readable ptxt, readable ptex, writable ptxt, writable ptex]
                              else return $ and [readable ptxt, writable ptxt]
 
+
 neuTrinker :: IO Trinker
 neuTrinker = do putStrLn "Neuer Trinker wird erstellt."
                 x <- askName
                 y <- askKontostand
-                z <- askMailAdress
+                z <- askmailaddress
                 putStr $ "Bitte geben Sie \"ok\" zum Bestätigen ein: Trinker " ++ showFarbe TBlau x ++ " mit einem Kontostand von " ++ showGuthaben (Guthaben y) ++ "  "
                 o <- getLine
                 if o == "ok" then return $ Trinker x (Guthaben y) z 0 True else putStrLn "Bestätigung nicht erhalten. Neuer Versuch:\n" >> neuTrinker
@@ -366,58 +396,68 @@ neuTrinker = do putStrLn "Neuer Trinker wird erstellt."
                          askKontostand :: IO Int
                          askKontostand = parseNumber Money "Bitte geben Sie einen validen Kontostand ein: "
 
-                         askMailAdress :: IO MailAdress
-                         askMailAdress = do putStr "Bitte geben Sie eine gültige E-Mail-Adresse ein (\"default\" für Standard, \"none\" für keine): " ; l <- getLine
-                                            case splitOn "@" l of {[""] -> return Mty ; ["none"] -> return NoAdress  ; ["default"] -> return DefaultAdress ; [x,y] -> return (Adress x y) ; _ -> askMailAdress}
+                         askmailaddress :: IO mailaddress
+                         askmailaddress = do putStr "Bitte geben Sie eine gültige E-Mail-Adresse ein (\"default\" für Standard, \"none\" für keine): " ; l <- getLine
+                                             case splitOn "@" l of {[""] -> return Mty ; ["none"] -> return NoAdress  ; ["default"] -> return DefaultAdress ; [x,y] -> return (Adress x y) ; _ -> askmailaddress}
 
-listLoop :: [Trinker] -> Config -> Int -> IO ()
-listLoop xs conf i = do
-                     if i >= length xs
-                        then do putStrLn $ "\n!! Sie haben das " ++ showFarbe TGelb "Ende" ++ " der aktuellen Liste erreicht. !!"
-                                putStr     "!! Bitte wählen sie aus: speichern/b(e)enden | (a)bbrechen | (n)euer Trinker | (z)urück : "
-                                c <- getLine
-                                case c of
-                                     "e"    -> ifM (frage "Wirklich beenden (bisherige Änderungen werden geschrieben)? Bitte geben Sie \"ok\" ein: ")
-                                               (writeFiles xs conf) (putStrLn "Doch nicht? Okay, weiter geht's!" >> listLoop xs conf i)
+listLoop :: RWST Environment () ListState IO ()
+listLoop = do
 
-                                     "a"    -> ifM (frage "Wirklich abbrechen (bisherige Änderungen werden verworfen)? Bitte geben Sie \"ok\" ein: ")
-                                               (putStrLn "Dann bis zum nächsten Mal! :)") (putStrLn "Doch nicht? Okay, weiter geht's!" >> listLoop xs conf i)
+  -- write current intermediate state to disk
+  st <- get
+  liftIO $ (writeFile "mateliste.partial") . show $ st
 
-                                     "n"    -> do neu <- neuTrinker ; listLoop (xs ++ [neu]) conf i
+  i <- index         $ st
+  l <- length . list $ st
 
-                                     'z':bs -> let z q = max (i-q) 0 in case (readInt NNothing . tail) c of {Nothing -> listLoop xs conf (z 1); Just n -> listLoop xs conf (z n)}
+{--
+  if i >= length xs
+     then do putStrLn $ "\n!! Sie haben das " ++ showFarbe TGelb "Ende" ++ " der aktuellen Liste erreicht. !!"
+             putStr     "!! Bitte wählen sie aus: speichern/b(e)enden | (a)bbrechen | (n)euer Trinker | (z)urück : "
+             c <- getLine
+             case c of
+                  "e"    -> ifM (frage "Wirklich beenden (bisherige Änderungen werden geschrieben)? Bitte geben Sie \"ok\" ein: ")
+                            (writeFiles xs conf) (putStrLn "Doch nicht? Okay, weiter geht's!" >> listLoop xs conf i)
 
-                                     _      -> putStrLn "Eingabe nicht verstanden. Ich wiederhole: " >> listLoop xs conf i
+                            "a"    -> ifM (frage "Wirklich abbrechen (bisherige Änderungen werden verworfen)? Bitte geben Sie \"ok\" ein: ")
+                            (putStrLn "Dann bis zum nächsten Mal! :)") (putStrLn "Doch nicht? Okay, weiter geht's!" >> listLoop xs conf i)
 
-                        else do let tr = (head . drop i) xs
-                                showTrinkerInfo tr
-                                putStr "Bitte wählen Sie aus! (a)bbrechen | (b)earbeiten | b(e)enden | (l)öschen | übe(r)schreiben | (v)or | (z)urück : "
-                                c <- getLine
-                                case c of
-                                     "a"    -> ifM (frage "Wirklich abbrechen (bisherige Änderungen werden verworfen)? Bitte geben Sie \"ok\" ein: ")
-                                               (putStrLn "Dann bis zum nächsten Mal! :)") (putStrLn "Doch nicht? Okay, weiter geht's!" >> listLoop xs conf i)
+                            "n"    -> do neu <- neuTrinker ; listLoop (xs ++ [neu]) conf i
 
-                                     "e"    -> ifM (frage "Wirklich beenden (bisherige Änderungen werden gespeichert)? Bitte geben Sie \"ok\" ein: ")
-                                               (writeFiles xs conf) (putStrLn "Doch nicht? Okay, weiter geht's!" >> listLoop xs conf i)
+                            'z':bs -> let z q = max (i-q) 0 in case (readInt NNothing . tail) c of {Nothing -> listLoop xs conf (z 1); Just n -> listLoop xs conf (z n)}
 
-                                     "l"    -> do putStr $ "Bitte geben Sie \"ok\" ein um " ++ showFarbe TBlau ((\(Trinker nm _ _ _ _) -> nm) tr) ++ " aus der Liste entfernen: " ; q <- getLine
-                                                  if q == "ok" then listLoop (take i xs ++ drop (i+1) xs) conf i else listLoop xs conf i
+                            _      -> putStrLn "Eingabe nicht verstanden. Ich wiederhole: " >> listLoop xs conf i
 
-                                     "r"    -> do neu <- neuTrinker ; listLoop (take i xs ++ neu:drop (i+1) xs) conf i
+             else do let tr = (head . drop i) xs
+                     showTrinkerInfo tr
+                     putStr "Bitte wählen Sie aus! (a)bbrechen | (b)earbeiten | b(e)enden | (l)öschen | übe(r)schreiben | (v)or | (z)urück : "
+                     c <- getLine
+                     case c of
+                          "a"    -> ifM (frage "Wirklich abbrechen (bisherige Änderungen werden verworfen)? Bitte geben Sie \"ok\" ein: ")
+                                    (putStrLn "Dann bis zum nächsten Mal! :)") (putStrLn "Doch nicht? Okay, weiter geht's!" >> listLoop xs conf i)
 
-                                     "b"    -> let foobar ti p = do putStr "Bitte geben Sie \"ok\" zum Bestätigen ein: " ; q <- getLine
-                                                                    case q of "ok" -> do k <- askEmail p
-                                                                                         listLoop (take i xs ++ k : drop (i+1) xs) conf (i+1)
-                                                                              ""   -> foobar ti p
-                                                                              _    -> putStr "Vorgang abgebrochen. Wiederhole:" >> listLoop xs conf i
-                                                in do p <- (\(Trinker name gth mMail ctr f) -> (getAmounts name >>= processTrinker (Trinker name gth mMail ctr True))) tr
-                                                      showTrinkerInfo p ; foobar tr p
+                          "e"    -> ifM (frage "Wirklich beenden (bisherige Änderungen werden gespeichert)? Bitte geben Sie \"ok\" ein: ")
+                                    (writeFiles xs conf) (putStrLn "Doch nicht? Okay, weiter geht's!" >> listLoop xs conf i)
 
-                                     'v':bs -> let z q = min (i+q) (length xs) in case (readInt NNothing . tail) c of {Nothing -> listLoop xs conf (z 1); Just n -> listLoop xs conf (z n)}
-                                     'z':bs -> let z q = max (i-q) 0           in case (readInt NNothing . tail) c of {Nothing -> listLoop xs conf (z 1); Just n -> listLoop xs conf (z n)}
+                          "l"    -> do putStr $ "Bitte geben Sie \"ok\" ein um " ++ showFarbe TBlau ((\(Trinker nm _ _ _ _) -> nm) tr) ++ " aus der Liste entfernen: " ; q <- getLine
+                                       if q == "ok" then listLoop (take i xs ++ drop (i+1) xs) conf i else listLoop xs conf i
 
-                                     ""     -> listLoop xs conf (min (i+1) (length xs))
-                                     _      -> putStr "Eingabe nicht verstanden. Ich wiederhole: " >> listLoop xs conf i
+                          "r"    -> do neu <- neuTrinker ; listLoop (take i xs ++ neu:drop (i+1) xs) conf i
+
+                          "b"    -> let foobar ti p = do putStr "Bitte geben Sie \"ok\" zum Bestätigen ein: " ; q <- getLine
+                                        case q of "ok" -> do k <- askEmail p
+                                                             listLoop (take i xs ++ k : drop (i+1) xs) conf (i+1)
+                                                  ""   -> foobar ti p
+                                                  _    -> putStr "Vorgang abgebrochen. Wiederhole:" >> listLoop xs conf i
+                                    in do p <- (\(Trinker name gth mMail ctr f) -> (getAmounts name >>= processTrinker (Trinker name gth mMail ctr True))) tr
+                                          showTrinkerInfo p ; foobar tr p
+
+                          'v':bs -> let z q = min (i+q) (length xs) in case (readInt NNothing . tail) c of {Nothing -> listLoop xs conf (z 1); Just n -> listLoop xs conf (z n)}
+                          'z':bs -> let z q = max (i-q) 0           in case (readInt NNothing . tail) c of {Nothing -> listLoop xs conf (z 1); Just n -> listLoop xs conf (z n)}
+
+                          ""     -> listLoop xs conf (min (i+1) (length xs))
+                          _      -> putStr "Eingabe nicht verstanden. Ich wiederhole: " >> listLoop xs conf i
+--}
 
 main :: IO ()
 main = do hSetBuffering stdout NoBuffering
